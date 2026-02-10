@@ -2,6 +2,8 @@ import streamlit as st
 import dns.resolver
 import pandas as pd
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import requests
+import time
 
 # -------------------------
 # Page Setup
@@ -14,15 +16,27 @@ uploaded_file = st.file_uploader("Upload TXT file with domains (one per line)", 
 resolver = dns.resolver.Resolver()
 resolver.nameservers = ['8.8.8.8', '1.1.1.1']
 
-progress_bar = st.progress(0)
-status_text = st.empty()
+# -------------------------
+# VirusTotal API
+# -------------------------
+VT_API_KEY = "dd460254e98cb6dd28bcb50bd291b81fbc9ac5fab0949abd169fd48b8ca1d891"
+VT_HEADERS = {"x-apikey": VT_API_KEY}
+
+# -------------------------
+# Read uploaded file (cached)
+# -------------------------
+@st.cache_data
+def read_domains(uploaded_file):
+    content = uploaded_file.read().decode("utf-8").splitlines()
+    domains = [d.strip().lower() for d in content if d.strip()]
+    return domains
 
 # -------------------------
 # DNS Check Functions
 # -------------------------
 def get_spf(domain):
     try:
-        answers = resolver.resolve(domain, "TXT")
+        answers = resolver.resolve(domain, "TXT", lifetime=5)
         for rdata in answers:
             txt = "".join([part.decode() for part in rdata.strings])
             if txt.lower().startswith("v=spf1"):
@@ -33,7 +47,7 @@ def get_spf(domain):
 
 def get_dmarc(domain):
     try:
-        answers = resolver.resolve(f"_dmarc.{domain}", "TXT")
+        answers = resolver.resolve(f"_dmarc.{domain}", "TXT", lifetime=5)
         for rdata in answers:
             txt = "".join([part.decode() for part in rdata.strings])
             if txt.lower().startswith("v=dmarc"):
@@ -43,42 +57,47 @@ def get_dmarc(domain):
     return None
 
 # -------------------------
-# Security Score Calculation
+# VirusTotal check with caching
 # -------------------------
-def calculate_security_score(dmarc, spf, plusall, qmark):
-    score = 0
-    if dmarc == "Yes":
-        score += 40
-    if spf == "Yes":
-        score += 30
-    if plusall == "Yes":
-        score -= 20
-    if qmark == "Yes":
-        score -= 10
-    return max(0, min(score, 100))
+vt_cache = {}
 
-def process_domain(domain):
+def check_virustotal(domain):
+    if domain in vt_cache:
+        return vt_cache[domain]
+    try:
+        url = f"https://www.virustotal.com/api/v3/domains/{domain}"
+        resp = requests.get(url, headers=VT_HEADERS, timeout=15)
+        if resp.status_code == 200:
+            data = resp.json()
+            stats = data.get("data", {}).get("attributes", {}).get("last_analysis_stats", {})
+            blacklist = "Yes" if stats.get("malicious", 0) > 0 else "No"
+        else:
+            blacklist = "Unknown"
+    except Exception:
+        blacklist = "Unknown"
+    vt_cache[domain] = blacklist
+    return blacklist
+
+# -------------------------
+# Process DNS only (fast)
+# -------------------------
+def process_dns_only(domain):
     spf = get_spf(domain)
     dmarc = get_dmarc(domain)
     spf_plus = "Yes" if spf and "+all" in spf.lower() else "No"
     spf_qmark = "Yes" if spf and "?all" in spf.lower() else "No"
-    score = calculate_security_score("Yes" if dmarc else "No",
-                                     "Yes" if spf else "No",
-                                     spf_plus,
-                                     spf_qmark)
     return {
         "Domain": domain,
         "DMARC": "Yes" if dmarc else "No",
         "SPF": "Yes" if spf else "No",
         "SPF +all": spf_plus,
         "SPF ?all": spf_qmark,
-        "Security Score": score,
         "MXToolbox": f'https://mxtoolbox.com/SuperTool.aspx?action=mx%3a{domain}',
         "Talos": f'https://talosintelligence.com/reputation_center/lookup?search={domain}',
     }
 
 # -------------------------
-# Modern dark table renderer
+# Render modern dark table
 # -------------------------
 def render_modern_table(df):
     html = """
@@ -115,21 +134,43 @@ def render_modern_table(df):
 # Main App Logic
 # -------------------------
 if uploaded_file:
-    domains = uploaded_file.read().decode("utf-8").splitlines()
-    domains = [d.strip().lower() for d in domains if d.strip()]
+    domains = read_domains(uploaded_file)
 
-    results = []
-    total = len(domains)
+    # -------------------------
+    # Step 1: DNS Checks (fast & parallel)
+    # -------------------------
+    if "df_dns" not in st.session_state:
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        dns_results = []
 
-    with st.spinner("Checking domains..."):
         with ThreadPoolExecutor(max_workers=20) as executor:
-            futures = {executor.submit(process_domain, d): d for d in domains}
+            futures = {executor.submit(process_dns_only, d): d for d in domains}
             for i, future in enumerate(as_completed(futures)):
-                results.append(future.result())
-                progress_bar.progress((i + 1) / total)
-                status_text.text(f"Processing {i + 1}/{total} domains...")
+                dns_results.append(future.result())
+                progress_bar.progress((i + 1)/len(domains))
+                status_text.text(f"Processing DNS {i + 1}/{len(domains)}")
 
-    df = pd.DataFrame(results)
+        st.session_state.df_dns = pd.DataFrame(dns_results)
+
+    df = st.session_state.df_dns.copy()
+
+    # -------------------------
+    # Step 2: VirusTotal Blacklist (rate-limited, progressive)
+    # -------------------------
+    if "df_blacklist" not in st.session_state:
+        blacklist_list = []
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        for i, domain in enumerate(df["Domain"]):
+            blacklist_list.append(check_virustotal(domain))
+            progress_bar.progress((i + 1)/len(df))
+            status_text.text(f"Checking VirusTotal {i + 1}/{len(df)}")
+            time.sleep(1)  # VT rate-limit, adjust for your tier
+        df["Blacklist"] = blacklist_list
+        st.session_state.df_blacklist = df
+    else:
+        df = st.session_state.df_blacklist.copy()
 
     # -------------------------
     # Sidebar Filters + Sorting
@@ -139,11 +180,13 @@ if uploaded_file:
     spf_filter = st.sidebar.selectbox("SPF", ["All", "Yes", "No"])
     plusall_filter = st.sidebar.selectbox("SPF +all", ["All", "Yes", "No"])
     qmark_filter = st.sidebar.selectbox("SPF ?all", ["All", "Yes", "No"])
-    min_score = st.sidebar.slider("Minimum Security Score", 0, 100, 0)
+    blacklist_filter = st.sidebar.selectbox("Blacklist", ["All", "Yes", "No"])
 
-    sort_column = st.sidebar.selectbox("Sort by column", df.columns.tolist(), index=df.columns.get_loc("Security Score"))
-    sort_ascending = st.sidebar.checkbox("Ascending order?", value=False)
+    sortable_columns = [col for col in df.columns if col not in ["MXToolbox", "Talos"]]
+    sort_column = st.sidebar.selectbox("Sort by column", sortable_columns, index=sortable_columns.index("Domain"))
+    sort_ascending = st.sidebar.checkbox("Ascending order?", value=True)
 
+    # Apply filters
     if dmarc_filter != "All":
         df = df[df["DMARC"] == dmarc_filter]
     if spf_filter != "All":
@@ -152,18 +195,20 @@ if uploaded_file:
         df = df[df["SPF +all"] == plusall_filter]
     if qmark_filter != "All":
         df = df[df["SPF ?all"] == qmark_filter]
-    df = df[df["Security Score"] >= min_score]
+    if blacklist_filter != "All":
+        df = df[df["Blacklist"] == blacklist_filter]
 
+    # Apply sorting
     df = df.sort_values(by=sort_column, ascending=sort_ascending)
 
     # -------------------------
-    # Render modern table
+    # Render Table
     # -------------------------
     st.subheader("Domain Results")
     st.markdown(render_modern_table(df), unsafe_allow_html=True)
 
     # -------------------------
-    # Download CSV
+    # CSV Download
     # -------------------------
     st.download_button(
         "Download results as CSV",
