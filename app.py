@@ -3,8 +3,11 @@ import dns.resolver
 import pandas as pd
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-st.set_page_config(page_title="Domain Security Checker", layout="wide")
-st.title("Domain Security & Reputation Checker (Cloud-Friendly)")
+# -------------------------
+# Page Setup
+# -------------------------
+st.set_page_config(page_title="Domain Security Dashboard", layout="wide")
+st.title("Domain Security & Reputation Dashboard")
 
 uploaded_file = st.file_uploader("Upload TXT file with domains (one per line)", type=["txt"])
 
@@ -14,6 +17,9 @@ resolver.nameservers = ['8.8.8.8', '1.1.1.1']
 progress_bar = st.progress(0)
 status_text = st.empty()
 
+# -------------------------
+# DNS Check Functions
+# -------------------------
 def get_spf(domain):
     try:
         answers = resolver.resolve(domain, "TXT")
@@ -36,6 +42,9 @@ def get_dmarc(domain):
         return None
     return None
 
+# -------------------------
+# Security Score Calculation
+# -------------------------
 def calculate_security_score(dmarc, spf, plusall, qmark):
     score = 0
     if dmarc == "Yes":
@@ -64,49 +73,47 @@ def process_domain(domain):
         "SPF +all": spf_plus,
         "SPF ?all": spf_qmark,
         "Security Score": score,
-        "MXToolbox": f'<a href="https://mxtoolbox.com/SuperTool.aspx?action=mx%3a{domain}" target="_blank">Open</a>',
-        "Talos": f'<a href="https://talosintelligence.com/reputation_center/lookup?search={domain}" target="_blank">Open</a>',
+        "MXToolbox": f'https://mxtoolbox.com/SuperTool.aspx?action=mx%3a{domain}',
+        "Talos": f'https://talosintelligence.com/reputation_center/lookup?search={domain}',
     }
 
-def color_cell(value, positive="Yes"):
-    """Soft pastel colors for Yes/No."""
-    if value == positive:
-        color = "#c8e6c9"  # light green
-    else:
-        color = "#ffcdd2"  # light red
-    return f'<td style="background-color:{color}; text-align:center">{value}</td>'
-
-def color_score(value):
-    """Pastel colors based on security score."""
-    if value > 70:
-        color = "#c8e6c9"  # green
-    elif value >= 40:
-        color = "#fff9c4"  # yellow
-    else:
-        color = "#ffcdd2"  # red
-    return f'<td style="background-color:{color}; text-align:center">{value}</td>'
-
-def render_color_table(df):
-    html = '<table border="1" style="border-collapse:collapse; width:100%"><tr>'
+# -------------------------
+# Modern dark table renderer
+# -------------------------
+def render_modern_table(df):
+    html = """
+    <div style="overflow-x:auto; max-height:600px; border-radius:8px; box-shadow: 0 4px 8px rgba(0,0,0,0.3);">
+    <table style="border-collapse: collapse; width:100%; font-family: Arial, sans-serif; border-radius:8px; overflow:hidden;">
+    <thead style="position: sticky; top: 0; background-color:#121212; color:white; z-index:1;">
+    <tr>
+    """
     for col in df.columns:
-        html += f'<th>{col}</th>'
-    html += '</tr>'
+        html += f'<th style="padding:10px; text-align:center; color:white">{col}</th>'
+    html += "</tr></thead><tbody>"
 
-    for _, row in df.iterrows():
-        html += '<tr>'
+    for _, (_, row) in enumerate(df.iterrows()):
+        html += f'<tr style="background-color:#1e1e1e; color:white; transition: all 0.2s;">'
         for col in df.columns:
-            if col in ["DMARC", "SPF", "SPF +all", "SPF ?all"]:
-                html += color_cell(row[col])
-            elif col == "Security Score":
-                html += color_score(row[col])
-            elif col in ["MXToolbox", "Talos"]:
-                html += f'<td style="text-align:center">{row[col]}</td>'
+            if col in ["MXToolbox", "Talos"]:
+                html += f'<td style="text-align:center; padding:8px;"><a href="{row[col]}" target="_blank" style="color:#4fc3f7; text-decoration:none;">Open</a></td>'
             else:
-                html += f'<td>{row[col]}</td>'
-        html += '</tr>'
-    html += '</table>'
+                html += f'<td style="text-align:center; padding:8px; color:white">{row[col]}</td>'
+        html += "</tr>"
+    html += """
+    </tbody></table>
+    <style>
+    table tr:hover {background-color: #333333;}
+    table th {border-bottom: 2px solid #444444;}
+    table td, table th {border-right: 1px solid #2c2c2c;}
+    table td:last-child, table th:last-child {border-right: none;}
+    </style>
+    </div>
+    """
     return html
 
+# -------------------------
+# Main App Logic
+# -------------------------
 if uploaded_file:
     domains = uploaded_file.read().decode("utf-8").splitlines()
     domains = [d.strip().lower() for d in domains if d.strip()]
@@ -124,7 +131,9 @@ if uploaded_file:
 
     df = pd.DataFrame(results)
 
-    # Sidebar filters
+    # -------------------------
+    # Sidebar Filters + Sorting
+    # -------------------------
     st.sidebar.header("Filters")
     dmarc_filter = st.sidebar.selectbox("DMARC", ["All", "Yes", "No"])
     spf_filter = st.sidebar.selectbox("SPF", ["All", "Yes", "No"])
@@ -132,7 +141,9 @@ if uploaded_file:
     qmark_filter = st.sidebar.selectbox("SPF ?all", ["All", "Yes", "No"])
     min_score = st.sidebar.slider("Minimum Security Score", 0, 100, 0)
 
-    # Apply filters
+    sort_column = st.sidebar.selectbox("Sort by column", df.columns.tolist(), index=df.columns.get_loc("Security Score"))
+    sort_ascending = st.sidebar.checkbox("Ascending order?", value=False)
+
     if dmarc_filter != "All":
         df = df[df["DMARC"] == dmarc_filter]
     if spf_filter != "All":
@@ -143,10 +154,17 @@ if uploaded_file:
         df = df[df["SPF ?all"] == qmark_filter]
     df = df[df["Security Score"] >= min_score]
 
-    # Render table
-    st.markdown(render_color_table(df), unsafe_allow_html=True)
+    df = df.sort_values(by=sort_column, ascending=sort_ascending)
 
-    # Download CSV (exclude clickable columns)
+    # -------------------------
+    # Render modern table
+    # -------------------------
+    st.subheader("Domain Results")
+    st.markdown(render_modern_table(df), unsafe_allow_html=True)
+
+    # -------------------------
+    # Download CSV
+    # -------------------------
     st.download_button(
         "Download results as CSV",
         df.drop(columns=["MXToolbox", "Talos"]).to_csv(index=False),
