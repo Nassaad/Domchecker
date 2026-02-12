@@ -1,218 +1,256 @@
 import streamlit as st
-import dns.resolver
 import pandas as pd
+import dns.resolver
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import requests
+import socket
 import time
 
 # -------------------------
 # Page Setup
 # -------------------------
-st.set_page_config(page_title="Domain Security Dashboard", layout="wide")
-st.title("Domain Security & Reputation Dashboard")
+st.set_page_config(page_title="Security Dashboard", layout="wide")
 
-uploaded_file = st.file_uploader("Upload TXT file with domains (one per line)", type=["txt"])
+# -------------------------
+# Sidebar Navigation
+# -------------------------
+page = st.sidebar.radio("Navigate to:", ["Welcome", "Domain Checks", "IP Checks"])
 
+# -------------------------
+# Resolver for DNS
+# -------------------------
 resolver = dns.resolver.Resolver()
-resolver.nameservers = ['8.8.8.8', '1.1.1.1']
+resolver.nameservers = ["8.8.8.8", "1.1.1.1"]
 
 # -------------------------
-# VirusTotal API
+# Welcome Page
 # -------------------------
-VT_API_KEY = "dd460254e98cb6dd28bcb50bd291b81fbc9ac5fab0949abd169fd48b8ca1d891"
-VT_HEADERS = {"x-apikey": VT_API_KEY}
+if page == "Welcome":
+    st.title("🛡️ Welcome to Security Dashboard")
+    st.markdown("""
+    Use the sidebar to navigate between **Domain Checks** and **IP Checks**.
+    
+    ### Instructions:
+    - Upload a TXT file with domains or IPs (one per line) on the respective page.
+    - Use the filters to refine results.
+    - Click links in the table to open MXToolbox or Talos checks in a new tab.
+    """)
 
 # -------------------------
-# Read uploaded file (cached)
+# Domain Checks Page
 # -------------------------
-@st.cache_data
-def read_domains(uploaded_file):
-    content = uploaded_file.read().decode("utf-8").splitlines()
-    domains = [d.strip().lower() for d in content if d.strip()]
-    return domains
+elif page == "Domain Checks":
+    st.title("📄 Domain Security & Reputation Checks")
 
-# -------------------------
-# DNS Check Functions
-# -------------------------
-def get_spf(domain):
-    try:
-        answers = resolver.resolve(domain, "TXT", lifetime=5)
-        for rdata in answers:
-            txt = "".join([part.decode() for part in rdata.strings])
-            if txt.lower().startswith("v=spf1"):
-                return txt
-    except:
-        return None
-    return None
+    uploaded_file = st.file_uploader("Upload TXT file with domains (one per line)", type=["txt"])
 
-def get_dmarc(domain):
-    try:
-        answers = resolver.resolve(f"_dmarc.{domain}", "TXT", lifetime=5)
-        for rdata in answers:
-            txt = "".join([part.decode() for part in rdata.strings])
-            if txt.lower().startswith("v=dmarc"):
-                return txt
-    except:
-        return None
-    return None
+    @st.cache_data
+    def read_domains(file):
+        content = file.read().decode("utf-8").splitlines()
+        return [d.strip().lower() for d in content if d.strip()]
 
-# -------------------------
-# VirusTotal check with caching
-# -------------------------
-vt_cache = {}
+    def get_spf(domain):
+        try:
+            answers = resolver.resolve(domain, "TXT", lifetime=5)
+            for rdata in answers:
+                txt = "".join([part.decode() for part in rdata.strings])
+                if txt.lower().startswith("v=spf1"):
+                    return txt
+        except:
+            return None
 
-def check_virustotal(domain):
-    if domain in vt_cache:
-        return vt_cache[domain]
-    try:
-        url = f"https://www.virustotal.com/api/v3/domains/{domain}"
-        resp = requests.get(url, headers=VT_HEADERS, timeout=15)
-        if resp.status_code == 200:
-            data = resp.json()
-            stats = data.get("data", {}).get("attributes", {}).get("last_analysis_stats", {})
-            blacklist = "Yes" if stats.get("malicious", 0) > 0 else "No"
-        else:
-            blacklist = "Unknown"
-    except Exception:
-        blacklist = "Unknown"
-    vt_cache[domain] = blacklist
-    return blacklist
+    def get_dmarc(domain):
+        try:
+            answers = resolver.resolve(f"_dmarc.{domain}", "TXT", lifetime=5)
+            for rdata in answers:
+                txt = "".join([part.decode() for part in rdata.strings])
+                if txt.lower().startswith("v=dmarc"):
+                    return txt
+        except:
+            return None
 
-# -------------------------
-# Process DNS only (fast)
-# -------------------------
-def process_dns_only(domain):
-    spf = get_spf(domain)
-    dmarc = get_dmarc(domain)
-    spf_plus = "Yes" if spf and "+all" in spf.lower() else "No"
-    spf_qmark = "Yes" if spf and "?all" in spf.lower() else "No"
-    return {
-        "Domain": domain,
-        "DMARC": "Yes" if dmarc else "No",
-        "SPF": "Yes" if spf else "No",
-        "SPF +all": spf_plus,
-        "SPF ?all": spf_qmark,
-        "MXToolbox": f'https://mxtoolbox.com/SuperTool.aspx?action=mx%3a{domain}',
-        "Talos": f'https://talosintelligence.com/reputation_center/lookup?search={domain}',
-    }
+    def process_domain(domain):
+        spf = get_spf(domain)
+        dmarc = get_dmarc(domain)
+        spf_plus = "Yes" if spf and "+all" in spf.lower() else "No"
+        spf_qmark = "Yes" if spf and "?all" in spf.lower() else "No"
+        return {
+            "Domain": domain,
+            "DMARC": "Yes" if dmarc else "No",
+            "SPF": "Yes" if spf else "No",
+            "SPF +all": spf_plus,
+            "SPF ?all": spf_qmark,
+            "MXToolbox": f"https://mxtoolbox.com/SuperTool.aspx?action=mx%3a{domain}",
+            "Talos": f"https://talosintelligence.com/reputation_center/lookup?search={domain}",
+            "Blacklist": f"https://mxtoolbox.com/SuperTool.aspx?action=blacklist%3a{domain}&run=toolpage"
+        }
 
-# -------------------------
-# Render modern dark table
-# -------------------------
-def render_modern_table(df):
-    html = """
-    <div style="overflow-x:auto; max-height:600px; border-radius:8px; box-shadow: 0 4px 8px rgba(0,0,0,0.3);">
-    <table style="border-collapse: collapse; width:100%; font-family: Arial, sans-serif; border-radius:8px; overflow:hidden;">
-    <thead style="position: sticky; top: 0; background-color:#121212; color:white; z-index:1;">
-    <tr>
-    """
-    for col in df.columns:
-        html += f'<th style="padding:10px; text-align:center; color:white">{col}</th>'
-    html += "</tr></thead><tbody>"
-
-    for _, (_, row) in enumerate(df.iterrows()):
-        html += f'<tr style="background-color:#1e1e1e; color:white; transition: all 0.2s;">'
-        for col in df.columns:
-            if col in ["MXToolbox", "Talos"]:
-                html += f'<td style="text-align:center; padding:8px;"><a href="{row[col]}" target="_blank" style="color:#4fc3f7; text-decoration:none;">Open</a></td>'
-            else:
-                html += f'<td style="text-align:center; padding:8px; color:white">{row[col]}</td>'
-        html += "</tr>"
-    html += """
-    </tbody></table>
-    <style>
-    table tr:hover {background-color: #333333;}
-    table th {border-bottom: 2px solid #444444;}
-    table td, table th {border-right: 1px solid #2c2c2c;}
-    table td:last-child, table th:last-child {border-right: none;}
-    </style>
-    </div>
-    """
-    return html
-
-# -------------------------
-# Main App Logic
-# -------------------------
-if uploaded_file:
-    domains = read_domains(uploaded_file)
-
-    # -------------------------
-    # Step 1: DNS Checks (fast & parallel)
-    # -------------------------
-    if "df_dns" not in st.session_state:
+    if uploaded_file:
+        domains = read_domains(uploaded_file)
         progress_bar = st.progress(0)
-        status_text = st.empty()
-        dns_results = []
+        results = []
 
         with ThreadPoolExecutor(max_workers=20) as executor:
-            futures = {executor.submit(process_dns_only, d): d for d in domains}
+            futures = {executor.submit(process_domain, d): d for d in domains}
             for i, future in enumerate(as_completed(futures)):
-                dns_results.append(future.result())
+                results.append(future.result())
                 progress_bar.progress((i + 1)/len(domains))
-                status_text.text(f"Processing DNS {i + 1}/{len(domains)}")
 
-        st.session_state.df_dns = pd.DataFrame(dns_results)
+        df = pd.DataFrame(results)
 
-    df = st.session_state.df_dns.copy()
+        # -------------------------
+        # Sidebar Filters
+        # -------------------------
+        st.sidebar.header("Filters")
+        dmarc_filter = st.sidebar.selectbox("DMARC", ["All", "Yes", "No"])
+        spf_filter = st.sidebar.selectbox("SPF", ["All", "Yes", "No"])
+        plusall_filter = st.sidebar.selectbox("SPF +all", ["All", "Yes", "No"])
+        qmark_filter = st.sidebar.selectbox("SPF ?all", ["All", "Yes", "No"])
+        blacklist_filter = st.sidebar.selectbox("Blacklist", ["All", "Yes", "No"])
 
-    # -------------------------
-    # Step 2: VirusTotal Blacklist (rate-limited, progressive)
-    # -------------------------
-    if "df_blacklist" not in st.session_state:
-        blacklist_list = []
+        df_filtered = df.copy()
+        if dmarc_filter != "All":
+            df_filtered = df_filtered[df_filtered["DMARC"] == dmarc_filter]
+        if spf_filter != "All":
+            df_filtered = df_filtered[df_filtered["SPF"] == spf_filter]
+        if plusall_filter != "All":
+            df_filtered = df_filtered[df_filtered["SPF +all"] == plusall_filter]
+        if qmark_filter != "All":
+            df_filtered = df_filtered[df_filtered["SPF ?all"] == qmark_filter]
+        if blacklist_filter != "All":
+            df_filtered = df_filtered[df_filtered["Blacklist"] == blacklist_filter]
+
+        # -------------------------
+        # Render Table
+        # -------------------------
+        def render_table(df):
+            html = """
+            <div style="overflow-x:auto; max-height:600px; border-radius:8px; box-shadow: 0 4px 8px rgba(0,0,0,0.3);">
+            <table style="border-collapse: collapse; width:100%; font-family: Arial, sans-serif; border-radius:8px; overflow:hidden;">
+            <thead style="position: sticky; top: 0; background-color:#121212; color:white; z-index:1;">
+            <tr>
+            """
+            for col in df.columns:
+                html += f'<th style="padding:10px; text-align:center; color:white">{col}</th>'
+            html += "</tr></thead><tbody>"
+
+            for _, row in df.iterrows():
+                html += f'<tr style="background-color:#1e1e1e; color:white;">'
+                for col in df.columns:
+                    if col in ["MXToolbox", "Talos", "Blacklist"]:
+                        html += f'<td style="text-align:center; padding:8px;"><a href="{row[col]}" target="_blank" style="color:#4fc3f7; text-decoration:none;">Open</a></td>'
+                    else:
+                        html += f'<td style="text-align:center; padding:8px; color:white">{row[col]}</td>'
+                html += "</tr>"
+            html += "</tbody></table></div>"
+            return html
+
+        st.subheader("Domain Results")
+        st.markdown(render_table(df_filtered), unsafe_allow_html=True)
+
+        st.download_button(
+            "Download results as CSV",
+            df_filtered.drop(columns=["MXToolbox", "Talos", "Blacklist"]).to_csv(index=False),
+            "domain_results.csv",
+            "text/csv"
+        )
+
+# -------------------------
+# IP Checks Page
+# -------------------------
+elif page == "IP Checks":
+    st.title("🌐 IP Checks Dashboard")
+
+    uploaded_file = st.file_uploader("Upload TXT file with IPs (one per line, max 50 per run)", type=["txt"])
+
+    def read_ips(file):
+        content = file.read().decode("utf-8").splitlines()
+        return [ip.strip() for ip in content if ip.strip()]
+
+    def reverse_dns(ip):
+        try:
+            return socket.gethostbyaddr(ip)[0]
+        except:
+            return None
+
+    def spamhaus_blacklist(ip):
+        try:
+            reversed_ip = ".".join(ip.split(".")[::-1])
+            query = f"{reversed_ip}.zen.spamhaus.org"
+            resolver.resolve(query, "A", lifetime=3)
+            return "Yes"
+        except dns.resolver.NXDOMAIN:
+            return "No"
+        except:
+            return "Unknown"
+
+    if uploaded_file:
+        ips = read_ips(uploaded_file)
+
+        if len(ips) > 50:
+            st.warning("⚠️ You can check a maximum of 50 IPs per run. Truncating list.")
+            ips = ips[:50]
+
         progress_bar = st.progress(0)
-        status_text = st.empty()
-        for i, domain in enumerate(df["Domain"]):
-            blacklist_list.append(check_virustotal(domain))
-            progress_bar.progress((i + 1)/len(df))
-            status_text.text(f"Checking VirusTotal {i + 1}/{len(df)}")
-            time.sleep(1)  # VT rate-limit, adjust for your tier
-        df["Blacklist"] = blacklist_list
-        st.session_state.df_blacklist = df
-    else:
-        df = st.session_state.df_blacklist.copy()
+        results = []
 
-    # -------------------------
-    # Sidebar Filters + Sorting
-    # -------------------------
-    st.sidebar.header("Filters")
-    dmarc_filter = st.sidebar.selectbox("DMARC", ["All", "Yes", "No"])
-    spf_filter = st.sidebar.selectbox("SPF", ["All", "Yes", "No"])
-    plusall_filter = st.sidebar.selectbox("SPF +all", ["All", "Yes", "No"])
-    qmark_filter = st.sidebar.selectbox("SPF ?all", ["All", "Yes", "No"])
-    blacklist_filter = st.sidebar.selectbox("Blacklist", ["All", "Yes", "No"])
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            futures = {executor.submit(lambda ip: {
+                "IP": ip,
+                "Reverse DNS": reverse_dns(ip),
+                "Spamhaus Blacklist": spamhaus_blacklist(ip),
+                "MXToolbox Blacklist": f"https://mxtoolbox.com/SuperTool.aspx?action=blacklist%3a{ip}&run=toolpage"
+            }, ip): ip for ip in ips}
 
-    sortable_columns = [col for col in df.columns if col not in ["MXToolbox", "Talos"]]
-    sort_column = st.sidebar.selectbox("Sort by column", sortable_columns, index=sortable_columns.index("Domain"))
-    sort_ascending = st.sidebar.checkbox("Ascending order?", value=True)
+            for i, future in enumerate(as_completed(futures)):
+                results.append(future.result())
+                progress_bar.progress((i + 1)/len(ips))
 
-    # Apply filters
-    if dmarc_filter != "All":
-        df = df[df["DMARC"] == dmarc_filter]
-    if spf_filter != "All":
-        df = df[df["SPF"] == spf_filter]
-    if plusall_filter != "All":
-        df = df[df["SPF +all"] == plusall_filter]
-    if qmark_filter != "All":
-        df = df[df["SPF ?all"] == qmark_filter]
-    if blacklist_filter != "All":
-        df = df[df["Blacklist"] == blacklist_filter]
+        df = pd.DataFrame(results)
 
-    # Apply sorting
-    df = df.sort_values(by=sort_column, ascending=sort_ascending)
+        # -------------------------
+        # Sidebar Filters for IPs
+        # -------------------------
+        st.sidebar.header("Filters")
+        reverse_filter = st.sidebar.selectbox("Reverse DNS Exists", ["All", "Yes", "No"])
+        spamhaus_filter = st.sidebar.selectbox("Spamhaus Blacklist", ["All", "Yes", "No", "Unknown"])
 
-    # -------------------------
-    # Render Table
-    # -------------------------
-    st.subheader("Domain Results")
-    st.markdown(render_modern_table(df), unsafe_allow_html=True)
+        df_filtered = df.copy()
+        if reverse_filter != "All":
+            df_filtered = df_filtered[df_filtered["Reverse DNS"].notnull() if reverse_filter == "Yes" else df_filtered["Reverse DNS"].isnull()]
+        if spamhaus_filter != "All":
+            df_filtered = df_filtered[df_filtered["Spamhaus Blacklist"] == spamhaus_filter]
 
-    # -------------------------
-    # CSV Download
-    # -------------------------
-    st.download_button(
-        "Download results as CSV",
-        df.drop(columns=["MXToolbox", "Talos"]).to_csv(index=False),
-        "domain_results.csv",
-        "text/csv"
-    )
+        # -------------------------
+        # Render modern dark table
+        # -------------------------
+        def render_table(df):
+            html = """
+            <div style="overflow-x:auto; max-height:600px; border-radius:8px; box-shadow: 0 4px 8px rgba(0,0,0,0.3);">
+            <table style="border-collapse: collapse; width:100%; font-family: Arial, sans-serif; border-radius:8px; overflow:hidden;">
+            <thead style="position: sticky; top: 0; background-color:#121212; color:white; z-index:1;">
+            <tr>
+            """
+            for col in df.columns:
+                html += f'<th style="padding:10px; text-align:center; color:white">{col}</th>'
+            html += "</tr></thead><tbody>"
+
+            for _, row in df.iterrows():
+                html += f'<tr style="background-color:#1e1e1e; color:white;">'
+                for col in df.columns:
+                    if col in ["MXToolbox Blacklist"]:
+                        html += f'<td style="text-align:center; padding:8px;"><a href="{row[col]}" target="_blank" style="color:#4fc3f7; text-decoration:none;">Open</a></td>'
+                    else:
+                        html += f'<td style="text-align:center; padding:8px; color:white">{row[col]}</td>'
+                html += "</tr>"
+            html += "</tbody></table></div>"
+            return html
+
+        st.subheader("IP Results")
+        st.markdown(render_table(df_filtered), unsafe_allow_html=True)
+
+        st.download_button(
+            "Download results as CSV",
+            df_filtered.drop(columns=["MXToolbox Blacklist"]).to_csv(index=False),
+            "ip_results.csv",
+            "text/csv"
+        )
